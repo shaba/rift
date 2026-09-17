@@ -8,6 +8,7 @@ description = "Rift agent engine: tool registry, agent loop, session state"
 
 [dependencies]
 rift-provider.workspace = true
+rift-typesafe.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true

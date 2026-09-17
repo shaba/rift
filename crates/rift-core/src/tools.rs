@@ -276,6 +276,10 @@ pub struct ToolCtx {
         std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<EditReviewRequest>>>>,
     /// SearXNG endpoint for the web_search tool; None = search unavailable.
     search_url: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// TypeSafe System One client for the `decide` tool; None = no API key
+    /// configured, which leaves the tool registered but inert (it explains
+    /// how to enable it rather than erroring cryptically).
+    typesafe: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<rift_typesafe::TypeSafeClient>>>>,
     /// Shared LSP manager: per-language diagnostics servers queried after
     /// write/edit. None = disabled or never installed — the edit result is
     /// then byte-identical to a no-LSP session.
@@ -329,6 +333,7 @@ impl ToolCtx {
             bash_wrapper: std::sync::Arc::new(std::sync::Mutex::new(None)),
             edit_review: std::sync::Arc::new(std::sync::Mutex::new(None)),
             search_url: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            typesafe: std::sync::Arc::new(std::sync::Mutex::new(None)),
             lsp: std::sync::Arc::new(std::sync::Mutex::new(None)),
             last_diff: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -355,6 +360,17 @@ impl ToolCtx {
 
     pub fn search_url(&self) -> Option<String> {
         self.search_url.lock().ok().and_then(|u| u.clone())
+    }
+
+    /// Install/clear the TypeSafe client (startup and /config reload).
+    pub fn set_typesafe(&self, client: Option<std::sync::Arc<rift_typesafe::TypeSafeClient>>) {
+        if let Ok(mut c) = self.typesafe.lock() {
+            *c = client;
+        }
+    }
+
+    pub fn typesafe(&self) -> Option<std::sync::Arc<rift_typesafe::TypeSafeClient>> {
+        self.typesafe.lock().ok().and_then(|c| c.clone())
     }
 
     /// Install the LSP manager (startup; None disables).
@@ -463,6 +479,8 @@ impl ToolCtx {
             edit_review: self.edit_review.clone(),
             // Research sub-agents search too.
             search_url: self.search_url.clone(),
+            // Sub-agents get the same typed-decision budget as the root.
+            typesafe: self.typesafe.clone(),
             // Sub-agent edits get the same diagnostics (same workspace root).
             lsp: self.lsp.clone(),
             // Own slot: a child's edits surface through its own loop.
@@ -1049,6 +1067,7 @@ impl ToolRegistry {
                 Box::new(RememberTool),
                 Box::new(FetchTool),
                 Box::new(WebSearchTool),
+                Box::new(DecideTool),
             ],
         }
     }
@@ -2109,6 +2128,201 @@ impl Tool for WebSearchTool {
   {url}
   {snippet}
 "));
+        }
+        Ok(out)
+    }
+}
+
+// ----------------------------------------------------------------- decide
+
+/// The model's access to a System One model (TypeSafe's Jev) for fast,
+/// calibrated, *typed* judgements — the ones it would otherwise answer from
+/// vibes mid-turn ("is this diff risky?", "which of these files is the
+/// culprit?", "how severe is this?").
+///
+/// Jev generates no text: it returns a probability per option and a
+/// calibrated confidence, in one round trip. That is the point — the answer
+/// comes back as a value this code can branch on, not prose to re-parse.
+struct DecideTool;
+
+/// Cap on the state we will ship. Input tokens are what TypeSafe bills, so a
+/// runaway paste (a whole repo dumped into `state`) must not silently become
+/// an expensive call.
+const DECIDE_STATE_MAX_CHARS: usize = 100_000;
+
+/// Turn one entry of the tool's `questions` array into a typed question.
+fn decide_question(v: &Value) -> Result<(String, rift_typesafe::Question)> {
+    use rift_typesafe::Question;
+    let obj = v.as_object().ok_or_else(|| anyhow!("each question must be an object"))?;
+    let id = obj
+        .get("id")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow!("each question needs a string \"id\""))?
+        .to_string();
+    let kind = obj
+        .get("type")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow!("question {id:?} needs a \"type\" of noul, choice, or score"))?;
+    // Instructions may be structured JSON, not just a string — the API
+    // accepts either, and a nested object often expresses a rubric better,
+    // so this is passed through as-is rather than coerced to a string.
+    let instructions = obj
+        .get("instructions")
+        .cloned()
+        .ok_or_else(|| anyhow!("question {id:?} needs \"instructions\""))?;
+    let q = match kind {
+        "noul" => {
+            let yes = obj.get("yes").and_then(|x| x.as_str()).map(str::to_string);
+            let no = obj.get("no").and_then(|x| x.as_str()).map(str::to_string);
+            rift_typesafe::Question::Noul { instructions, yes, no }
+        }
+        "choice" => {
+            // Accept both an object map (option -> rubric) and a bare array
+            // of option names; models reach for either.
+            let raw = obj
+                .get("options")
+                .ok_or_else(|| anyhow!("choice question {id:?} needs \"options\""))?;
+            let options: Vec<(String, Option<String>)> = match raw {
+                Value::Object(m) => m
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().map(str::to_string)))
+                    .collect(),
+                Value::Array(a) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| (s.to_string(), None)))
+                    .collect(),
+                _ => bail!("choice question {id:?}: \"options\" must be an object or array"),
+            };
+            Question::Choice { instructions, options }
+        }
+        "score" => {
+            let levels: Vec<String> = obj
+                .get("levels")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .ok_or_else(|| anyhow!("score question {id:?} needs \"levels\" (ordered, low to high)"))?;
+            Question::Score { instructions, levels }
+        }
+        other => bail!("question {id:?}: unknown type {other:?} (use noul, choice, or score)"),
+    };
+    Ok((id, q))
+}
+
+/// Render one answer for the model, leading with the value it should branch
+/// on and following with the distribution behind it.
+fn render_answer(id: &str, a: &rift_typesafe::Answer) -> String {
+    use rift_typesafe::Answer;
+    let dist = |a: &Answer| {
+        let r = a.ranked();
+        if r.is_empty() {
+            return String::new();
+        }
+        let parts: Vec<String> = r.iter().map(|(k, p)| format!("{k} {p:.2}")).collect();
+        format!("\n    {}", parts.join(" · "))
+    };
+    match a {
+        Answer::Noul { noul } => {
+            // A noul has no confidence field: the probability IS the
+            // uncertainty, and 0.5 means "genuinely unsure".
+            let verdict = if *noul >= 0.5 { "yes" } else { "no" };
+            format!("  {id}: {verdict} (p={noul:.2})")
+        }
+        Answer::Choice { choice, confidence, .. } => {
+            format!("  {id}: {choice} (confidence {confidence:.2}){}", dist(a))
+        }
+        Answer::Score { score, legend, confidence, .. } => {
+            let nearest = legend
+                .get(&format!("{}", score.round() as i64))
+                .map(|d| format!(" — nearest level: {d}"))
+                .unwrap_or_default();
+            let top = legend.len().saturating_sub(1);
+            format!("  {id}: {score:.2}/{top}{nearest} (confidence {confidence:.2}){}", dist(a))
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for DecideTool {
+    fn name(&self) -> &str {
+        "decide"
+    }
+    fn description(&self) -> &str {
+        "Ask a decision model (TypeSafe Jev) one or more typed questions about some state and get \
+         back calibrated probabilities instead of prose. Types: noul (yes/no, returns the \
+         probability of yes), choice (pick one of a set, returns a probability per option), score \
+         (rate against ordered levels). Ask every question you need in ONE call — the state is \
+         billed once per call, not once per question. Use it to commit to a judgement you would \
+         otherwise guess at; it cannot write text, do arithmetic, or extract values."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["state", "questions"],
+            "properties": {
+                "state": {
+                    "description": "The content to evaluate: a string, or a JSON object/array of structured state (files, a diff, a chat log, program state)."
+                },
+                "questions": {
+                    "type": "array",
+                    "description": "One or more typed questions. Answers come back under the same ids.",
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "type", "instructions"],
+                        "properties": {
+                            "id": {"type": "string", "description": "Your name for this question"},
+                            "type": {"type": "string", "enum": ["noul", "choice", "score"]},
+                            "instructions": {"type": "string", "description": "What to decide"},
+                            "options": {"type": "object", "description": "choice only: option name -> description (or null)"},
+                            "levels": {"type": "array", "items": {"type": "string"}, "description": "score only: ordered levels, low to high, at least two"},
+                            "yes": {"type": "string", "description": "noul only: what a yes means"},
+                            "no": {"type": "string", "description": "noul only: what a no means"}
+                        }
+                    }
+                }
+            }
+        })
+    }
+    async fn execute(&self, args: &Map<String, Value>, ctx: &ToolCtx) -> Result<String> {
+        let Some(client) = ctx.typesafe() else {
+            bail!(
+                "the decide tool is not configured — it needs a TypeSafe API key (TYPESAFE_API_KEY, \
+                 or a \"typesafe\" entry in the rift config). Make the judgement yourself and say \
+                 you did, or ask the user to configure it."
+            );
+        };
+        let state = args
+            .get("state")
+            .cloned()
+            .ok_or_else(|| anyhow!("decide needs \"state\" — the content to evaluate"))?;
+        // Cap only string state; structured state is the shape the API
+        // prefers and is rarely the runaway case.
+        let state = match state {
+            Value::String(s) if s.chars().count() > DECIDE_STATE_MAX_CHARS => {
+                let head: String = s.chars().take(DECIDE_STATE_MAX_CHARS).collect();
+                Value::String(format!("{head}\n[state truncated]"))
+            }
+            other => other,
+        };
+        let raw = args
+            .get("questions")
+            .and_then(|q| q.as_array())
+            .ok_or_else(|| anyhow!("decide needs \"questions\" — an array of typed questions"))?;
+        if raw.is_empty() {
+            bail!("decide needs at least one question");
+        }
+        let mut questions = Vec::new();
+        for v in raw {
+            questions.push(decide_question(v)?);
+        }
+        let ev = client.evaluate(&state, &questions).await?;
+
+        let mut out = format!("decision ({}, {} input tokens)\n", ev.model, ev.usage.input_tokens);
+        // Report in the order asked, not the map's order.
+        for (id, _) in &questions {
+            match ev.get(id) {
+                Some(a) => out.push_str(&format!("{}\n", render_answer(id, a))),
+                None => out.push_str(&format!("  {id}: (no answer returned)\n")),
+            }
         }
         Ok(out)
     }

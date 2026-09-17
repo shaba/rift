@@ -185,6 +185,8 @@ rift --prompt "Fix the failing test in src/lib.rs"
 # WarpDrive: race models on a task in isolated git worktrees, then merge the winner
 rift swarm "Refactor the auth middleware" --models gemma4:26b,anthropic/claude-sonnet-5
 rift swarm "Fix the failing test" --models gemma4:26b,qwen3.6:35b --judge ornith:35b
+# ...or referee with a System One model: the winner comes back typed, with a confidence
+rift swarm "Fix the failing test" --models gemma4:26b,qwen3.6:35b --judge jev
 rift merge 0-gemma4-26b --cleanup
 ```
 
@@ -213,7 +215,7 @@ Env vars: `RIFT_HOST`, `RIFT_MODEL`. Flags: `--num-ctx` (default 32768), `--max-
 | `/btw <question>` | quick side question (Claude Code-style): it sees the whole conversation but has no tools, the exchange never enters the main history, and it works even while the agent is mid-turn — ask asides (related or not) without polluting context; `/btw clear` resets the side thread |
 | `/plan [clear]` | the agent's task checklist (also pinned live in the activity pane) |
 | `/tools` · `/mcp` · `/permissions` | what the model can call, MCP server status, permission rules + approval state. `/permissions add\|remove <allow\|ask\|deny> <Tool(pattern)>` edits the rules live — `Bash(git push *)`, `Edit(src/**)`, `Read(~/.ssh/**)` |
-| `/swarm <task> [--models a,b] [--judge m] [--explore]` | WarpDrive race without leaving the chat — models may span providers; the optional judge scores the diffs and recommends a winner |
+| `/swarm <task> [--models a,b] [--judge m] [--explore]` | WarpDrive race without leaving the chat — models may span providers; the optional judge scores the diffs and recommends a winner. `--judge jev` (or `typesafe/jev-latest`) referees with a TypeSafe System One model instead: only candidates that actually changed something are offered as options, so the pick is always a real candidate, and it arrives with a calibrated confidence |
 | `/merge <name> [--cleanup]` | apply a swarm candidate's patch |
 | `/undo` | revert the last turn's write/edit changes |
 | `/rewind [n]` | checkpoint restore: rewind n turns (default 1) — write/edit changes AND the conversation roll back together (up to 20 turns; bash-made changes are outside the journal) |
@@ -310,6 +312,23 @@ rift --model openrouter/qwen/qwen3-30b-a3b       # one-off
 
 Each provider takes a `base_url` (a `/v1` suffix is added if you omit it) and, if the endpoint needs auth, either `api_key_env` (name of an environment variable to read — keeps the secret out of the file) or a literal `api_key`. `/model provider/model` switches providers live within a session; a bare model name always routes to the Ollama `host`.
 
+### Typed decisions (TypeSafe System One / Jev)
+
+A **System One model** is not a chat model. It generates no text, calls no tools, and does not stream — it takes some state plus typed questions and returns typed answers with calibrated probabilities, in one round trip. That makes it the wrong shape for a `Provider` and the right shape for the decisions rift would otherwise have to phrase as a prompt and parse back out of prose.
+
+Three question types: **noul** (yes/no, returns the probability of yes), **choice** (one of a set, returns a probability per option plus a confidence), and **score** (a position on an ordered rubric). Configure it user-side — `typesafe` is deliberately ignored in a project `.rift.json`, so a cloned repo can never redirect where your API key is sent:
+
+```json
+{ "typesafe": { "api_key_env": "TYPESAFE_API_KEY", "model": "jev-latest" } }
+```
+
+With no config at all rift reads `TYPESAFE_API_KEY` from the environment; with no key anywhere the feature stays inert rather than failing at call time. Two things use it:
+
+- **The `decide` tool.** The model asks its own typed questions mid-turn ("is this diff risky?", "which of these files is the culprit?") and gets back a value to branch on instead of a hunch. Every question in one call — state is billed once per call, not once per question.
+- **The `jev` swarm judge.** `--judge jev` (or `typesafe/jev-1.13.0` to pin) referees a WarpDrive race. The chat judge has to be *asked* for a `WINNER:` line and then parsed, which can miss, hallucinate a name, or pick a candidate that changed nothing. Here the winner is a `choice` over only the candidates that actually produced a patch, so an illegal pick is unrepresentable, and a separate yes/no gates whether *any* candidate solved the task at all. Low-confidence picks are flagged rather than presented as clean recommendations.
+
+Jev cannot do arithmetic, extract values from free text, or write anything — it decides. Keep the questions narrow and let your code act on the answer.
+
 ## Skills
 
 Package reusable instructions as [Agent Skills](https://agentskills.io)-style `SKILL.md` files:
@@ -355,7 +374,8 @@ The model can delegate with its `agent` tool: 1–4 self-contained tasks run as 
 - `crates/rift-ollama` — native Ollama client: NDJSON streaming, tool calls, thinking, capability detection, truncation detection.
 - `crates/rift-openai` — OpenAI-compatible client: SSE streaming, tool-call correlation by id, string-encoded arguments (vLLM, LM Studio, llama.cpp, OpenRouter, LiteLLM, Ollama `/v1`).
 - `crates/rift-anthropic` — Anthropic-format client: content blocks, `tool_use`/`tool_result` mapping, prompt caching, adaptive thinking.
-- `crates/rift-core` — agent engine: tool registry (read/write/edit/bash/ls/grep/glob/outline/repo_map/plan/task/agent/fetch/web_search/remember + `ask_user` and `skill` in interactive sessions), agent loop, per-family prompt targets, compaction, sub-agents, background tasks, sessions, permissions, local-model hardening.
+- `crates/rift-typesafe` — TypeSafe **System One** client (Jev): typed `noul`/`choice`/`score` decisions with calibrated probabilities. Deliberately *not* a `Provider` — a System One model emits no text, no tool calls and no stream, so it powers decisions (the `decide` tool, the `jev` swarm judge) rather than conversation.
+- `crates/rift-core` — agent engine: tool registry (read/write/edit/bash/ls/grep/glob/outline/repo_map/plan/task/agent/fetch/web_search/decide/remember + `ask_user` and `skill` in interactive sessions), agent loop, per-family prompt targets, compaction, sub-agents, background tasks, sessions, permissions, local-model hardening.
 - `crates/rift-tui` — `rift` binary: ratatui frontend, `--serve` protocol for editor integrations, headless mode.
 
 See `docs/PROJECT.md` for status and roadmap, `docs/RESEARCH.md` for the protocol/architecture research this is built on.

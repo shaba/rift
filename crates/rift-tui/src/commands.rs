@@ -1228,7 +1228,17 @@ async fn cmd_swarm(
     }
     let mut verdict_note = String::new();
     if let Some(judge_model) = judge {
-        match rift_core::judge_swarm(&factory, &judge_model, base_cfg.num_ctx, &task, &outcomes).await {
+        let typesafe = agent.ctx().typesafe();
+        match rift_core::judge_race(
+            typesafe.as_deref(),
+            &factory,
+            &judge_model,
+            base_cfg.num_ctx,
+            &task,
+            &outcomes,
+        )
+        .await
+        {
             Ok(v) => {
                 out.push_str(&format!("\njudge ({judge_model}):\n{}\n", v.text.trim()));
                 if let Some(w) = &v.winner {

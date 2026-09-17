@@ -3,6 +3,42 @@
 All notable changes to rift. Versions follow the roadmap phases in
 [docs/ROADMAP.md](docs/ROADMAP.md); dates are release dates.
 
+## v2.9.0 — 2026-09-17
+
+- **Typed decisions: TypeSafe System One (Jev) support.** A System One model
+  is not a chat model — it generates no text, calls no tools and does not
+  stream. It takes state plus typed questions and returns typed answers with
+  calibrated probabilities in a single round trip. That makes it the wrong
+  shape for a `Provider` and the right shape for the judgements rift was
+  previously phrasing as prompts and parsing back out of prose. New
+  `crates/rift-typesafe` speaks `POST /v1/systemone` with all three
+  primitives — `noul` (yes/no probability), `choice` (one of a set, with a
+  probability per option and a confidence) and `score` (a position on an
+  ordered rubric) — and models the fact that **only choice and score carry a
+  confidence**, so a noul can never contribute a fabricated one to a gate.
+  Retries 429/529 with backoff; never retries a 401 or a 422.
+- **New `decide` tool.** The model asks its own typed questions mid-turn and
+  gets a value to branch on instead of a hunch. All questions go in one call
+  (state is billed once per call, not once per question), and malformed
+  questions are rejected locally rather than costing a round trip. With no
+  API key configured the tool stays registered but inert, explaining how to
+  enable it instead of erroring cryptically.
+- **`--judge jev`: a typed swarm referee.** The chat judge has to be *asked*
+  for a `WINNER:` line and then parsed — which can miss the line, name a
+  candidate that does not exist, or pick one that changed nothing (the rule
+  it was given in prose, then re-checked in code). The System One judge makes
+  the winner a `choice` over **only** the candidates that actually produced a
+  patch, so an illegal pick is unrepresentable rather than merely forbidden,
+  and asks a separate yes/no in the same call to gate whether any candidate
+  solved the task at all. Verdicts carry a calibrated confidence; low-confidence
+  picks are flagged for review rather than presented as clean recommendations.
+  `--judge <chat-model>` is unchanged.
+- **TypeSafe credentials are user-config only.** A project `.rift.json`
+  cannot set `typesafe` — it is ignored with a warning, the same treatment
+  `editor` gets. A cloned repo must not be able to redirect where an API key
+  is sent. The client also defaults its scheme to **https**, unlike rift's
+  LAN-first model hosts, so a bearer token is never defaulted onto cleartext.
+
 ## v2.8.8 — 2026-08-28
 
 - **Restores everything from v2.8.0–v2.8.6.** v2.8.7 was cut from a branch

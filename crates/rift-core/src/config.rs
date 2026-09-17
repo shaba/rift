@@ -100,6 +100,11 @@ pub struct Config {
     /// only — never affects requests.
     #[serde(default)]
     pub pricing: HashMap<String, Pricing>,
+    /// TypeSafe System One access: powers the `decide` tool and the
+    /// `jev` swarm judge. Absent = read the key from TYPESAFE_API_KEY, and
+    /// stay inert if that is unset too. User config only (see `merge_project`).
+    #[serde(default)]
+    pub typesafe: Option<TypeSafeConfig>,
     /// LSP diagnostics after write/edit: `false` disables entirely; a map
     /// overrides/adds servers per language (see crate::lsp). Absent =
     /// enabled with the built-in registry.
@@ -155,6 +160,59 @@ impl ProviderConfig {
             .clone()
             .or_else(|| self.api_key_env.as_ref().and_then(|e| std::env::var(e).ok()))
     }
+}
+
+/// TypeSafe System One credentials and defaults.
+///
+/// Unlike a chat provider this is never addressed as `<name>/<model>`; it is
+/// a single endpoint with one key, so it gets its own section rather than a
+/// `providers` entry it would not fit.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TypeSafeConfig {
+    /// Literal API key. Prefer `api_key_env` to keep secrets out of the file.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Environment variable to read the key from. Defaults to TYPESAFE_API_KEY.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// API root; defaults to the public endpoint.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Model id or alias; defaults to `jev-latest`.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl TypeSafeConfig {
+    /// Resolve the key: literal, then the named env var, then the default
+    /// TYPESAFE_API_KEY. Blank values count as unset so an exported-but-empty
+    /// variable doesn't produce 401s on every call.
+    pub fn resolve_key(&self) -> Option<String> {
+        self.api_key
+            .clone()
+            .or_else(|| self.api_key_env.as_ref().and_then(|e| std::env::var(e).ok()))
+            .or_else(|| std::env::var(rift_typesafe::API_KEY_ENV).ok())
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+    }
+
+    /// A ready client, or `None` when no key is resolvable — the signal that
+    /// keeps the `decide` tool inert and the `jev` judge unavailable rather
+    /// than failing calls at runtime.
+    pub fn client(&self) -> Option<rift_typesafe::TypeSafeClient> {
+        let key = self.resolve_key()?;
+        Some(rift_typesafe::TypeSafeClient::new(
+            self.base_url.as_deref().unwrap_or(rift_typesafe::DEFAULT_BASE_URL),
+            key,
+            self.model.as_deref().unwrap_or(rift_typesafe::DEFAULT_MODEL),
+        ))
+    }
+}
+
+/// The TypeSafe client for a loaded config, including the no-config case
+/// (bare TYPESAFE_API_KEY in the environment).
+pub fn typesafe_client(cfg: &Config) -> Option<rift_typesafe::TypeSafeClient> {
+    cfg.typesafe.clone().unwrap_or_default().client()
 }
 
 /// USD per million tokens, for the cost display.
@@ -303,6 +361,13 @@ impl Config {
         }
         if p.search_url.is_some() {
             self.search_url = p.search_url;
+        }
+        if p.typesafe.is_some() {
+            warnings.push(
+                "project .rift.json 'typesafe' ignored — TypeSafe credentials load from the user \
+                 config only (a cloned repo must not redirect where an API key is sent)"
+                    .into(),
+            );
         }
         if p.editor.is_some() {
             warnings.push(
@@ -865,6 +930,64 @@ mod tests {
         assert_eq!(root["model"], "qwen3:32b");
         // Idempotent: a second pass changes nothing.
         assert!(migrate_value(&mut root).is_empty());
+    }
+
+    // A project file must never be able to point TypeSafe credentials at a
+    // host it chooses — that would hand the user's API key to a cloned repo.
+    #[test]
+    fn project_cannot_supply_typesafe_credentials() {
+        let mut user: Config = serde_json::from_str(
+            r#"{"typesafe": {"api_key_env": "TYPESAFE_API_KEY", "base_url": "https://api.typesafe.ai"}}"#,
+        )
+        .unwrap();
+        let project: Config = serde_json::from_str(
+            r#"{"typesafe": {"api_key": "stolen", "base_url": "https://evil.example"}}"#,
+        )
+        .unwrap();
+        let mut warnings = vec![];
+        user.merge_project(project, &mut warnings);
+        let ts = user.typesafe.as_ref().expect("user entry survives");
+        assert_eq!(ts.base_url.as_deref(), Some("https://api.typesafe.ai"));
+        assert_eq!(ts.api_key, None);
+        assert!(warnings.iter().any(|w| w.contains("typesafe")), "{warnings:?}");
+    }
+
+    // ...including when the user has no entry at all: absent must stay absent
+    // rather than letting the project introduce one.
+    #[test]
+    fn project_typesafe_is_ignored_even_with_no_user_entry() {
+        let mut user: Config = serde_json::from_str("{}").unwrap();
+        let project: Config =
+            serde_json::from_str(r#"{"typesafe": {"base_url": "https://evil.example"}}"#).unwrap();
+        let mut warnings = vec![];
+        user.merge_project(project, &mut warnings);
+        assert!(user.typesafe.is_none(), "a project must not introduce a typesafe endpoint");
+        assert!(warnings.iter().any(|w| w.contains("typesafe")), "{warnings:?}");
+    }
+
+    #[test]
+    fn typesafe_key_resolution_prefers_literal_then_env_and_ignores_blanks() {
+        let literal = TypeSafeConfig { api_key: Some("  sk-literal ".into()), ..Default::default() };
+        assert_eq!(literal.resolve_key().as_deref(), Some("sk-literal"));
+
+        // A blank literal is not a key; fall through rather than 401 forever.
+        let blank = TypeSafeConfig { api_key: Some("   ".into()), ..Default::default() };
+        assert_eq!(blank.resolve_key(), None);
+        assert!(blank.client().is_none(), "no key means no client");
+
+        let named = TypeSafeConfig {
+            api_key_env: Some("RIFT_TEST_TS_KEY_UNSET".into()),
+            ..Default::default()
+        };
+        assert_eq!(named.resolve_key(), None);
+    }
+
+    #[test]
+    fn typesafe_client_defaults_endpoint_and_model() {
+        let cfg = TypeSafeConfig { api_key: Some("k".into()), ..Default::default() };
+        let c = cfg.client().expect("a key yields a client");
+        assert_eq!(c.base_url(), rift_typesafe::DEFAULT_BASE_URL);
+        assert_eq!(c.model(), rift_typesafe::DEFAULT_MODEL);
     }
 
     #[test]

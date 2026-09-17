@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "rift-anthropic"
-version = "2.8.8"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "rift-core"
-version = "2.8.8"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1268,6 +1268,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rift-provider",
+ "rift-typesafe",
  "serde",
  "serde_json",
  "thiserror",
@@ -1283,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "rift-ollama"
-version = "2.8.8"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1298,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "rift-openai"
-version = "2.8.8"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1312,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "rift-provider"
-version = "2.8.8"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1325,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "rift-tui"
-version = "2.8.8"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1337,12 +1338,25 @@ dependencies = [
  "rift-core",
  "rift-ollama",
  "rift-openai",
+ "rift-typesafe",
  "serde",
  "serde_json",
  "syntect",
  "textwrap",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "rift-typesafe"
+version = "2.9.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "rift-provider",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

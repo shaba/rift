@@ -20,7 +20,8 @@ pub mod trace;
 
 pub use agent::{Agent, AgentConfig, AgentEvent, TurnStats, EFFORT_LEVELS};
 pub use config::{
-    mcp_entry_trusted, trust_mcp_entry, untrust_mcp_entry, Config, LoadedConfig, ProviderConfig,
+    mcp_entry_trusted, trust_mcp_entry, typesafe_client, untrust_mcp_entry, Config, LoadedConfig,
+    ProviderConfig, TypeSafeConfig,
 };
 pub use lsp::{LspManager, LspSetting};
 pub use mcp::{McpClient, McpTool};
@@ -30,7 +31,8 @@ pub use skills::{load_skills, skills_prompt_section, Skill, SkillTool};
 pub use subagent::{AgentPersona, AgentTool, SubAgentHandle};
 pub use tasks::{BgTasks, TaskKind, TaskStatus, TaskView};
 pub use swarm::{
-    judge_swarm, run_swarm, Candidate, CandidateOutcome, JudgeVerdict, ProviderFactory, Swarm,
+    is_system_one_judge, judge_race, judge_swarm, judge_swarm_system_one, run_swarm, Candidate,
+    CandidateOutcome, JudgeVerdict, ProviderFactory, Swarm,
 };
 pub use permissions::{Decision, RuleSet};
 pub use tools::{

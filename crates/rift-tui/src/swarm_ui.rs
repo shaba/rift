@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use rift_core::{
-    judge_swarm, run_swarm, AgentConfig, AgentEvent, Candidate, CandidateOutcome, JudgeVerdict,
+    run_swarm, AgentConfig, AgentEvent, Candidate, CandidateOutcome, JudgeVerdict,
     ProviderFactory, Swarm, TurnStats,
 };
 use ratatui::crossterm::event::{
@@ -257,14 +257,23 @@ fn draw(frame: &mut Frame, app: &mut SwarmApp, task: &str) {
     frame.render_widget(Paragraph::new(status), status_area);
 }
 
+/// How a race gets refereed: which judge model was asked for (if any) and
+/// the System One client available to it. Grouped so the two travel
+/// together — a judge spec naming `jev` is meaningless without the client.
+pub struct JudgeSetup {
+    pub model: Option<String>,
+    pub typesafe: Option<Arc<rift_typesafe::TypeSafeClient>>,
+}
+
 pub async fn run_swarm_tui(
     factory: ProviderFactory,
     cfg: AgentConfig,
     swarm: Swarm,
     candidates: Vec<Candidate>,
     task: String,
-    judge: Option<String>,
+    judge: JudgeSetup,
 ) -> Result<()> {
+    let JudgeSetup { model: judge, typesafe } = judge;
     let swarm = Arc::new(swarm);
     let (tx, mut rx) = mpsc::unbounded_channel::<(usize, AgentEvent)>();
     let cancel = CancellationToken::new();
@@ -330,8 +339,17 @@ pub async fn run_swarm_tui(
                             app.message = format!("judge ({judge_model}) is scoring the candidates…");
                             let factory = factory.clone();
                             let task = task.clone();
+                            let typesafe = typesafe.clone();
                             judge_handle = Some(tokio::spawn(async move {
-                                judge_swarm(&factory, &judge_model, num_ctx, &task, &outcomes).await
+                                rift_core::judge_race(
+                                    typesafe.as_deref(),
+                                    &factory,
+                                    &judge_model,
+                                    num_ctx,
+                                    &task,
+                                    &outcomes,
+                                )
+                                .await
                             }));
                         }
                     }

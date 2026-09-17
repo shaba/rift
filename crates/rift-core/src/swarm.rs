@@ -370,6 +370,10 @@ pub struct JudgeVerdict {
     pub winner: Option<String>,
     /// The judge's full scoring text, shown to the user.
     pub text: String,
+    /// Calibrated certainty in `winner`, 0..1 — only a System One judge
+    /// reports one. `None` from the chat judge, which has no calibrated
+    /// notion of how sure it is.
+    pub confidence: Option<f64>,
 }
 
 /// Cap per-candidate patch text shown to the judge — enough to see the whole
@@ -503,7 +507,249 @@ pub async fn judge_swarm(
             winner = None;
         }
     }
-    Ok(JudgeVerdict { winner, text })
+    Ok(JudgeVerdict { winner, text, confidence: None })
+}
+
+// ---- System One (Jev) judge ----------------------------------------------
+
+/// Question ids. Both are asked in ONE call: `state` (every diff) is the
+/// expensive part of the request and is billed once per call, not per
+/// question — the documented fan-out pattern.
+const Q_WINNER: &str = "winner";
+const Q_ANY_CORRECT: &str = "any_correct";
+
+/// Below this probability that *any* candidate is correct, the race has no
+/// winner. This is the check the chat judge can only be asked to make for
+/// itself — and then has to be re-verified in code, because it sometimes
+/// picks anyway.
+const ANY_CORRECT_MIN: f64 = 0.5;
+/// Below this confidence the pick is still reported, but flagged for review
+/// rather than presented as a clean recommendation.
+const LOW_CONFIDENCE: f64 = 0.5;
+
+/// Does this judge spec name a System One model rather than a chat model?
+/// Accepts `jev`, a pinned `jev-1.13.0`, or the provider-prefixed
+/// `typesafe/<model>` form rift already uses for cloud routing.
+pub fn is_system_one_judge(judge_model: &str) -> bool {
+    let m = judge_model.trim().to_lowercase();
+    m == "jev" || m.starts_with("jev-") || m.starts_with("typesafe/")
+}
+
+/// The System One model id inside a judge spec (`typesafe/jev-1.13.0` ->
+/// `jev-1.13.0`, bare `jev` -> the default alias).
+pub fn system_one_model(judge_model: &str) -> String {
+    let m = judge_model.trim();
+    let m = m.strip_prefix("typesafe/").or_else(|| m.strip_prefix("TypeSafe/")).unwrap_or(m);
+    if m.eq_ignore_ascii_case("jev") || m.is_empty() {
+        rift_typesafe::DEFAULT_MODEL.to_string()
+    } else {
+        m.to_string()
+    }
+}
+
+/// Only candidates that actually produced a change may win — the same rule
+/// the chat judge is told in prose. Here it is enforced structurally: an
+/// ineligible candidate is never offered as an option, so the model cannot
+/// pick one.
+fn eligible(outcomes: &[CandidateOutcome]) -> Vec<&CandidateOutcome> {
+    outcomes.iter().filter(|o| o.patch_path.is_some() && o.error.is_none()).collect()
+}
+
+/// The race as structured state. Jev takes program state directly, so the
+/// diffs go in as data rather than being flattened into a prompt.
+fn jev_state(task: &str, outcomes: &[CandidateOutcome]) -> serde_json::Value {
+    let candidates: Vec<serde_json::Value> = outcomes
+        .iter()
+        .map(|o| {
+            let mut m = serde_json::json!({
+                "name": o.candidate.name,
+                "model": o.candidate.model,
+            });
+            if let Some(e) = &o.error {
+                m["status"] = "errored".into();
+                m["error"] = e.clone().into();
+            } else if let Some(path) = &o.patch_path {
+                let patch = std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| format!("(patch unreadable: {e})"));
+                m["status"] = "changed".into();
+                m["diff_stat"] = o.diff_stat.trim().into();
+                m["patch"] = cap(&patch, JUDGE_PATCH_MAX_CHARS, "patch").into();
+            } else {
+                m["status"] = "no changes".into();
+            }
+            if !o.summary.is_empty() {
+                // Labelled as a claim: the model must weigh the diff, not the
+                // candidate's own account of it.
+                m["self_reported_summary"] = cap(&o.summary, JUDGE_SUMMARY_MAX_CHARS, "summary").into();
+            }
+            m
+        })
+        .collect();
+    serde_json::json!({ "task": task, "candidates": candidates })
+}
+
+/// Render a typed verdict for humans: the decision first, then the
+/// distribution it came from.
+fn render_jev_verdict(
+    model: &str,
+    winner: &Option<String>,
+    confidence: Option<f64>,
+    any_correct: f64,
+    ranked: &[(String, f64)],
+    outcomes: &[CandidateOutcome],
+) -> String {
+    let mut t = format!("judge: {model} (System One — typed decision, no prose)
+");
+    let verdict = if any_correct >= ANY_CORRECT_MIN { "yes" } else { "no" };
+    t.push_str(&format!("any candidate correct? {verdict} (p={any_correct:.2})
+"));
+    match winner {
+        Some(w) => {
+            let c = confidence.unwrap_or(0.0);
+            t.push_str(&format!("winner: {w} (confidence {c:.2})
+"));
+            if c < LOW_CONFIDENCE {
+                t.push_str("  low confidence — read the diff before merging
+");
+            }
+        }
+        None if any_correct < ANY_CORRECT_MIN => {
+            t.push_str("winner: none — no candidate is likely to have solved the task
+");
+        }
+        None => t.push_str("winner: none
+"),
+    }
+    if !ranked.is_empty() {
+        t.push_str("scores:
+");
+        for (name, p) in ranked {
+            t.push_str(&format!("  {name}: {p:.2}
+"));
+        }
+    }
+    let skipped: Vec<String> = outcomes
+        .iter()
+        .filter(|o| o.patch_path.is_none() || o.error.is_some())
+        .map(|o| {
+            let why = if o.error.is_some() { "errored" } else { "no changes" };
+            format!("{} ({why})", o.candidate.name)
+        })
+        .collect();
+    if !skipped.is_empty() {
+        t.push_str(&format!("not eligible: {}
+", skipped.join(", ")));
+    }
+    t
+}
+
+/// Score a finished race with a System One model.
+///
+/// The chat judge has to be *asked* for a `WINNER:` line and then parsed,
+/// with all the failure modes that implies — a missing line, a hallucinated
+/// name, a pick that breaks the rules it was given. Here the winner is a
+/// `choice` over the eligible candidates, so it comes back as a name that
+/// exists, plus a probability per candidate and a calibrated confidence.
+pub async fn judge_swarm_system_one(
+    client: &rift_typesafe::TypeSafeClient,
+    task: &str,
+    outcomes: &[CandidateOutcome],
+) -> Result<JudgeVerdict> {
+    let runners = eligible(outcomes);
+    if runners.is_empty() {
+        // Nothing to choose between — don't spend a call to be told so.
+        return Ok(JudgeVerdict {
+            winner: None,
+            text: "judge: no candidate produced changes — nothing to judge
+".into(),
+            confidence: None,
+        });
+    }
+
+    let options: Vec<(String, Option<String>)> = runners
+        .iter()
+        .map(|o| {
+            let stat = o.diff_stat.trim().replace('\n', "; ");
+            (
+                o.candidate.name.clone(),
+                Some(format!("produced by {} — {}", o.candidate.model, stat)),
+            )
+        })
+        .collect();
+
+    let questions = vec![
+        (
+            Q_WINNER.to_string(),
+            rift_typesafe::Question::choice(
+                "Every candidate was given the same task in an identical copy of the repository.                  Which candidate's diff best accomplishes it? Judge the diffs ONLY: correctness                  first, then prefer the smaller, cleaner change. A self_reported_summary is the                  candidate's own claim, not evidence.",
+                options,
+            ),
+        ),
+        (
+            Q_ANY_CORRECT.to_string(),
+            rift_typesafe::Question::noul_with(
+                "Does at least one candidate's diff correctly and completely accomplish the task?",
+                "At least one diff is a correct and complete solution to the task.",
+                "No diff correctly and completely solves the task — all are wrong, partial, or off-target.",
+            ),
+        ),
+    ];
+
+    let state = jev_state(task, outcomes);
+    let ev = client.evaluate(&state, &questions).await.context("system one judge call")?;
+
+    let winner_answer = ev.require(Q_WINNER)?;
+    let any_correct = ev
+        .get(Q_ANY_CORRECT)
+        .and_then(|a| a.as_noul())
+        // A missing noul must not silently promote a winner; treat it as
+        // "not established".
+        .unwrap_or(0.0);
+
+    let picked = winner_answer.as_choice().map(str::to_string);
+    let confidence = winner_answer.confidence();
+    let ranked = winner_answer.ranked();
+
+    // Gate on correctness, then re-verify eligibility. The option list made
+    // an ineligible pick impossible, but a future API change must not turn
+    // that into a silently wrong merge recommendation.
+    let mut winner = if any_correct >= ANY_CORRECT_MIN { picked } else { None };
+    if let Some(w) = &winner {
+        if !runners.iter().any(|o| &o.candidate.name == w) {
+            winner = None;
+        }
+    }
+
+    let text = render_jev_verdict(&ev.model, &winner, confidence, any_correct, &ranked, outcomes);
+    Ok(JudgeVerdict { winner, text, confidence })
+}
+
+/// Judge a race with whichever referee `judge_model` names: a System One
+/// model (`jev`, `typesafe/jev-latest`) or an ordinary chat model.
+///
+/// `typesafe` is the configured client, or `None` when no API key is set —
+/// in which case naming a System One judge is a clear error rather than a
+/// silent downgrade to a different referee than the one that was asked for.
+pub async fn judge_race(
+    typesafe: Option<&rift_typesafe::TypeSafeClient>,
+    provider_for: &ProviderFactory,
+    judge_model: &str,
+    num_ctx: u64,
+    task: &str,
+    outcomes: &[CandidateOutcome],
+) -> Result<JudgeVerdict> {
+    if is_system_one_judge(judge_model) {
+        let Some(client) = typesafe else {
+            bail!(
+                "judge {judge_model} is a TypeSafe System One model but no API key is configured \
+                 — set {} or a \"typesafe\" entry in the rift config, or name a chat model as judge",
+                rift_typesafe::API_KEY_ENV
+            )
+        };
+        let client = client.with_model(system_one_model(judge_model));
+        return judge_swarm_system_one(&client, task, outcomes).await;
+    }
+    judge_swarm(provider_for, judge_model, num_ctx, task, outcomes).await
 }
 
 #[cfg(test)]
@@ -537,6 +783,127 @@ mod tests {
         assert_eq!(parse_winner("no verdict line at all", &outs), None);
         // Ambiguous partial that matches nothing stays None.
         assert_eq!(parse_winner("WINNER: candidate-7", &outs), None);
+    }
+
+    #[test]
+    fn system_one_judge_specs_are_recognized_and_normalized() {
+        for spec in ["jev", "JEV", "jev-1.13.0", "typesafe/jev-latest", " typesafe/jev "] {
+            assert!(is_system_one_judge(spec), "{spec:?} should route to a System One judge");
+        }
+        // Chat judges must keep going to the chat path.
+        for spec in ["gemma4:26b", "anthropic/claude-opus-5", "openrouter/qwen3", "jevons"] {
+            assert!(!is_system_one_judge(spec), "{spec:?} must not route to System One");
+        }
+        assert_eq!(system_one_model("jev"), rift_typesafe::DEFAULT_MODEL);
+        assert_eq!(system_one_model("typesafe/jev"), rift_typesafe::DEFAULT_MODEL);
+        assert_eq!(system_one_model("typesafe/jev-1.13.0"), "jev-1.13.0");
+        assert_eq!(system_one_model("jev-1.13.0"), "jev-1.13.0");
+    }
+
+    // Only candidates that changed something may be offered as options —
+    // this is what makes an illegal pick unrepresentable rather than merely
+    // discouraged.
+    #[test]
+    fn only_changed_candidates_are_eligible() {
+        let mut errored = outcome("c", true);
+        errored.error = Some("boom".into());
+        let outs = vec![outcome("a", true), outcome("b", false), errored];
+        let names: Vec<&str> = eligible(&outs).iter().map(|o| o.candidate.name.as_str()).collect();
+        assert_eq!(names, ["a"]);
+    }
+
+    #[test]
+    fn jev_state_carries_task_status_and_claims() {
+        let mut outs = vec![outcome("a", true), outcome("b", false)];
+        outs[0].summary = "fixed the parser".into();
+        outs[0].diff_stat = "1 file changed".into();
+        let st = jev_state("fix the bug", &outs);
+        assert_eq!(st["task"], "fix the bug");
+        assert_eq!(st["candidates"][0]["name"], "a");
+        assert_eq!(st["candidates"][0]["status"], "changed");
+        // A self-summary must travel labelled as a claim, not as evidence.
+        assert_eq!(st["candidates"][0]["self_reported_summary"], "fixed the parser");
+        assert_eq!(st["candidates"][1]["status"], "no changes");
+        // An unreadable patch degrades to a note instead of panicking.
+        assert!(st["candidates"][0]["patch"].as_str().unwrap().contains("unreadable"));
+    }
+
+    #[test]
+    fn errored_candidate_state_reports_the_error() {
+        let mut e = outcome("a", false);
+        e.error = Some("worktree exploded".into());
+        let st = jev_state("t", &[e]);
+        assert_eq!(st["candidates"][0]["status"], "errored");
+        assert_eq!(st["candidates"][0]["error"], "worktree exploded");
+    }
+
+    #[test]
+    fn verdict_text_reports_decision_distribution_and_skips() {
+        let outs = vec![outcome("a", true), outcome("b", false)];
+        let ranked = vec![("a".to_string(), 0.8), ("b".to_string(), 0.2)];
+        let t = render_jev_verdict(
+            "jev-1.13.0",
+            &Some("a".into()),
+            Some(0.77),
+            0.9,
+            &ranked,
+            &outs,
+        );
+        assert!(t.contains("jev-1.13.0"));
+        assert!(t.contains("any candidate correct? yes (p=0.90)"));
+        assert!(t.contains("winner: a (confidence 0.77)"));
+        assert!(t.contains("a: 0.80"));
+        assert!(t.contains("not eligible: b (no changes)"));
+        assert!(!t.contains("low confidence"));
+    }
+
+    #[test]
+    fn low_confidence_pick_is_flagged_for_review() {
+        let outs = vec![outcome("a", true)];
+        let t = render_jev_verdict("jev-1.13.0", &Some("a".into()), Some(0.31), 0.9, &[], &outs);
+        assert!(t.contains("low confidence — read the diff before merging"));
+    }
+
+    #[test]
+    fn no_winner_text_explains_why_when_nothing_was_correct() {
+        let outs = vec![outcome("a", true)];
+        let t = render_jev_verdict("jev-1.13.0", &None, None, 0.12, &[], &outs);
+        assert!(t.contains("no candidate is likely to have solved the task"));
+    }
+
+    // With nothing mergeable there is no decision to buy — the judge must
+    // not spend an API call to be told the race was empty.
+    #[tokio::test]
+    async fn empty_race_is_judged_without_a_request() {
+        let outs = vec![outcome("a", false)];
+        // An unroutable base URL: if this tried to call out, it would error.
+        let client = rift_typesafe::TypeSafeClient::new("https://127.0.0.1:1", "k", "jev-latest");
+        let v = judge_swarm_system_one(&client, "t", &outs).await.unwrap();
+        assert!(v.winner.is_none());
+        assert!(v.text.contains("nothing to judge"));
+    }
+
+    // Asking for a System One judge with no key must say so plainly, not
+    // quietly referee the race with some other model.
+    #[tokio::test]
+    async fn system_one_judge_without_a_key_is_a_clear_error() {
+        let factory: ProviderFactory =
+            std::sync::Arc::new(|_: &str| bail!("the chat judge must not be used here"));
+        let outs = vec![outcome("a", true)];
+        let e = judge_race(None, &factory, "jev", 8192, "t", &outs).await.unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("TYPESAFE_API_KEY"), "{msg}");
+        assert!(msg.contains("no API key is configured"), "{msg}");
+    }
+
+    // A chat judge spec must still reach the chat path, key or no key.
+    #[tokio::test]
+    async fn chat_judge_spec_still_routes_to_the_chat_judge() {
+        let factory: ProviderFactory =
+            std::sync::Arc::new(|_: &str| bail!("chat judge reached"));
+        let outs = vec![outcome("a", true)];
+        let e = judge_race(None, &factory, "gemma4:26b", 8192, "t", &outs).await.unwrap_err();
+        assert!(format!("{e:#}").contains("chat judge reached"));
     }
 
     #[test]

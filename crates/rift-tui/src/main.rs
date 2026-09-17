@@ -368,7 +368,19 @@ async fn main() -> Result<()> {
                 always_task: true,
             };
             let factory = provider_factory(&host, &config.providers);
-            return run_swarm_cli(factory, cfg_base, task, models, *explore, judge.clone(), *no_tui).await;
+            return run_swarm_cli(
+                factory,
+                cfg_base,
+                task,
+                models,
+                *explore,
+                swarm_ui::JudgeSetup {
+                    model: judge.clone(),
+                    typesafe: rift_core::typesafe_client(&config).map(std::sync::Arc::new),
+                },
+                *no_tui,
+            )
+            .await;
         }
         Some(Cmd::Merge { name, cleanup }) => {
             let swarm = Swarm::discover(&std::env::current_dir()?).await?;
@@ -517,6 +529,13 @@ async fn main() -> Result<()> {
         eprintln!("web search: {u}");
     }
     ctx.set_search_url(config.search_url.clone());
+    // TypeSafe System One: powers the `decide` tool and the `jev` swarm
+    // judge. Absent key = both stay inert, never an error at call time.
+    let typesafe = rift_core::typesafe_client(&config).map(std::sync::Arc::new);
+    if let Some(ts) = &typesafe {
+        eprintln!("typed decisions: {} ({})", ts.base_url(), ts.model());
+    }
+    ctx.set_typesafe(typesafe.clone());
     app::set_config_editor(config.editor.clone());
     let (ask_tx, ask_rx) = mpsc::unbounded_channel::<AskRequest>();
     if interactive || cli.serve {
@@ -883,9 +902,10 @@ async fn run_swarm_cli(
     task: &str,
     models: &str,
     explore: bool,
-    judge: Option<String>,
+    judge: swarm_ui::JudgeSetup,
     no_tui: bool,
 ) -> Result<()> {
+    let swarm_ui::JudgeSetup { model: judge, typesafe } = judge;
     const COLORS: [&str; 6] = ["\x1b[36m", "\x1b[35m", "\x1b[32m", "\x1b[33m", "\x1b[34m", "\x1b[31m"];
     let swarm = Swarm::discover(&std::env::current_dir()?).await?;
 
@@ -913,7 +933,15 @@ async fn run_swarm_cli(
 
     use std::io::IsTerminal;
     if !no_tui && std::io::stdout().is_terminal() {
-        return swarm_ui::run_swarm_tui(factory, cfg_base, swarm, candidates, task.to_string(), judge).await;
+        return swarm_ui::run_swarm_tui(
+            factory,
+            cfg_base,
+            swarm,
+            candidates,
+            task.to_string(),
+            swarm_ui::JudgeSetup { model: judge, typesafe },
+        )
+        .await;
     }
 
     println!("WarpDrive swarm: {} candidate(s) on task: {task}", candidates.len());
@@ -975,7 +1003,16 @@ async fn run_swarm_cli(
 
     if let Some(judge_model) = judge {
         println!("\n=== judge ({judge_model}) ===");
-        match rift_core::judge_swarm(&factory, &judge_model, cfg_base.num_ctx, task, &outcomes).await {
+        match rift_core::judge_race(
+            typesafe.as_deref(),
+            &factory,
+            &judge_model,
+            cfg_base.num_ctx,
+            task,
+            &outcomes,
+        )
+        .await
+        {
             Ok(v) => {
                 println!("{}", v.text.trim());
                 // Machine-parseable verdict line (the judge bench keys on it).

@@ -16,6 +16,7 @@ rift-core.workspace = true
 rift-ollama.workspace = true
 rift-openai.workspace = true
 rift-anthropic.workspace = true
+rift-typesafe.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 serde.workspace = true
