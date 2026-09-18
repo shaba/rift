@@ -267,7 +267,11 @@ jobs:
             exit 0
           fi
           rustup update stable
-          for crate in rift-provider rift-ollama rift-openai rift-anthropic rift-core; do
+          # Dependency order: a crate must already be on the registry before
+          # anything that depends on it publishes. rift-typesafe sits after
+          # rift-provider (its only internal dep) and before rift-core, which
+          # depends on it.
+          for crate in rift-provider rift-ollama rift-openai rift-anthropic rift-typesafe rift-core; do
             cargo publish -p "$crate" ||
               echo "::warning::cargo publish $crate failed (already published?)"
           done
