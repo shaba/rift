@@ -56,6 +56,62 @@ fn tool_calls_of(deltas: &[StreamDelta]) -> Vec<ToolCall> {
         .collect()
 }
 
+#[tokio::test]
+async fn requests_identify_rift_and_keep_bearer_auth() {
+    let server = MockServer::start(vec![
+        MockResponse::json(200, r#"{"data":[{"id":"test-model"}]}"#),
+        MockResponse::json(
+            200,
+            r#"{"data":[{"id":"test-model","context_length":4096}]}"#,
+        ),
+        MockResponse::stream(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+        ]),
+    ])
+    .await;
+    let client = OpenAiClient::new(&server.base_url, Some("fake-api-key".into()));
+
+    client.tags().await.expect("tags should succeed");
+    client
+        .show("test-model")
+        .await
+        .expect("show should succeed");
+    let mut on_delta = |_| {};
+    client
+        .chat_stream(&chat_req(), &mut on_delta)
+        .await
+        .expect("chat should succeed");
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 3);
+    let expected_user_agent = format!("user-agent: rift/{}", env!("CARGO_PKG_VERSION"));
+    for (request, path) in requests.iter().zip([
+        "GET /v1/models",
+        "GET /v1/models",
+        "POST /v1/chat/completions",
+    ]) {
+        let headers = request
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(
+            request.starts_with(path),
+            "unexpected request path: {request}"
+        );
+        assert!(
+            headers.lines().any(|line| line == expected_user_agent),
+            "missing expected User-Agent in: {request}"
+        );
+        assert!(
+            headers
+                .lines()
+                .any(|line| line == "authorization: bearer fake-api-key"),
+            "missing bearer auth in: {request}"
+        );
+    }
+}
+
 // An SSE event split mid-JSON across network reads must reassemble; content
 // arrives in order.
 #[tokio::test]
