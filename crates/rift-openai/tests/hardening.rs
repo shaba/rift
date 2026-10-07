@@ -244,12 +244,29 @@ async fn absurd_tool_call_index_is_rejected() {
 // Non-2xx responses surface the status and the server's error message.
 #[tokio::test]
 async fn http_error_includes_status_and_message() {
-    let server =
-        MockServer::start(vec![MockResponse::json(500, "{\"error\":{\"message\":\"backend exploded\"}}")]).await;
-    let r = run(&server, &chat_req()).await;
-    let err = format!("{:#}", r.outcome.expect_err("500 must fail"));
-    assert!(err.contains("500"), "status missing: {err}");
-    assert!(err.contains("backend exploded"), "message missing: {err}");
+    for (status, message) in [
+        (401, "invalid API key"),
+        (402, "quota exhausted"),
+        (500, "backend exploded"),
+    ] {
+        let body = serde_json::json!({"error": {"message": message}}).to_string();
+        let server = MockServer::start(vec![
+            MockResponse::json(status, &body),
+            MockResponse::stream(&[
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+            ]),
+        ])
+        .await;
+        let r = run(&server, &chat_req()).await;
+        let err = format!("{:#}", r.outcome.expect_err("HTTP error must fail"));
+        assert!(err.contains(&status.to_string()), "status missing: {err}");
+        assert!(err.contains(message), "message missing: {err}");
+        assert_eq!(
+            server.requests().await.len(),
+            1,
+            "HTTP errors must not retry"
+        );
+    }
 }
 
 // Reasoning deltas (DeepSeek-style `reasoning_content`) stream as thinking,
@@ -345,4 +362,75 @@ async fn image_attachments_become_content_parts() {
         raw.contains("\"image_url\":{\"url\":\"data:image/png;base64,AAAABBBB\"}"),
         "image_url part missing: {raw}"
     );
+}
+
+// A mock OpenAI-compatible server exercises a nested API root.
+#[tokio::test]
+async fn reasoning_and_tool_history_round_trip_on_nested_api_root() {
+    let server = MockServer::start(vec![
+        MockResponse::json(200, r#"{"data":[{"id":"test-model"}]}"#),
+        MockResponse::stream(&[
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect the file\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"main.rs\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        ]),
+        MockResponse::stream(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"finished\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ]),
+    ]).await;
+    let client = OpenAiClient::new(
+        format!("{}/coding/v1", server.base_url),
+        Some("fake-api-key".into()),
+    );
+    assert_eq!(client.tags().await.unwrap()[0].name, "test-model");
+    let mut req = chat_req();
+    let mut deltas = Vec::new();
+    let first = client
+        .chat_stream(&req, &mut |d| deltas.push(d))
+        .await
+        .unwrap();
+    assert_eq!(first.message.thinking.as_deref(), Some("inspect the file"));
+    assert!(deltas
+        .iter()
+        .any(|d| matches!(d, StreamDelta::Thinking(t) if t == "inspect the file")));
+    assert_eq!(first.message.tool_calls[0].id.as_deref(), Some("call_1"));
+    assert_eq!(
+        first.message.tool_calls[0].function.arguments["path"],
+        "main.rs"
+    );
+    let mut result = Message::tool_result("read", "fn main() {}");
+    result.tool_call_id = first.message.tool_calls[0].id.clone();
+    req.messages.push(first.message);
+    req.messages.push(result);
+    let final_reply = client.chat_stream(&req, &mut |_| {}).await.unwrap();
+    assert_eq!(final_reply.message.content, "finished");
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 3);
+    for (raw, line) in requests.iter().zip([
+        "GET /coding/v1/models HTTP/1.1",
+        "POST /coding/v1/chat/completions HTTP/1.1",
+        "POST /coding/v1/chat/completions HTTP/1.1",
+    ]) {
+        let head = raw.split("\r\n\r\n").next().unwrap().to_lowercase();
+        assert_eq!(raw.lines().next().unwrap(), line);
+        assert!(head
+            .lines()
+            .any(|h| h == "authorization: bearer fake-api-key"));
+        assert!(head
+            .lines()
+            .any(|h| h == format!("user-agent: rift/{}", env!("CARGO_PKG_VERSION"))));
+    }
+    for raw in &requests[1..] {
+        let body: serde_json::Value =
+            serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["model"], "test-model");
+    }
+    let replay: serde_json::Value =
+        serde_json::from_str(requests[2].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(
+        replay["messages"][1]["reasoning_content"],
+        "inspect the file"
+    );
+    assert_eq!(replay["messages"][1]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(replay["messages"][2]["role"], "tool");
+    assert_eq!(replay["messages"][2]["tool_call_id"], "call_1");
 }
