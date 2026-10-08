@@ -364,6 +364,56 @@ async fn image_attachments_become_content_parts() {
     );
 }
 
+// Empty replies, including reasoning-only replies whose old thinking the
+// agent strips, must not poison the next turn or a resumed session.
+#[tokio::test]
+async fn empty_stream_reply_is_not_replayed_on_next_turn() {
+    for thinking in [None, Some("unfinished reasoning")] {
+        let first_stream = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices": [{"delta": {
+                "reasoning_content": thinking,
+            }, "finish_reason": "stop"}]}),
+        );
+        let server = MockServer::start(vec![
+            MockResponse::stream(&[&first_stream]),
+            MockResponse::stream(&[
+                "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            ]),
+        ]).await;
+        let client = OpenAiClient::new(format!("{}/coding/v1", server.base_url), None);
+        let mut req = chat_req();
+        req.model = "kimi-for-coding".into();
+        let first = client.chat_stream(&req, &mut |_| {}).await.unwrap();
+        assert!(first.message.content.is_empty());
+        assert!(first.message.tool_calls.is_empty());
+        assert_eq!(first.message.thinking.as_deref(), thinking);
+        req.messages.push(first.message);
+        req.messages.push(Message::user("continue"));
+        // Session save/load retains the empty assistant, and request building
+        // in the agent removes thinking from turns before the latest user.
+        req.messages =
+            serde_json::from_value(serde_json::to_value(&req.messages).unwrap()).unwrap();
+        req.messages[1].thinking = None;
+        let next = client.chat_stream(&req, &mut |_| {}).await.unwrap();
+        assert_eq!(next.message.content, "recovered");
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 2, "must recover without a 400 retry");
+        assert!(requests[1].starts_with("POST /coding/v1/chat/completions "));
+        let body: serde_json::Value =
+            serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "hi"},
+                {"role": "user", "content": "continue"},
+            ]),
+            "thinking={thinking:?}"
+        );
+        assert_eq!(req.messages.len(), 3, "saved history must remain intact");
+    }
+}
+
 // A mock OpenAI-compatible server exercises a nested API root.
 #[tokio::test]
 async fn reasoning_and_tool_history_round_trip_on_nested_api_root() {
